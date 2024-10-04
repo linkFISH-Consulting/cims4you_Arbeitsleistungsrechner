@@ -89,7 +89,7 @@
                     var taetigkeit = eintrag[8];
 
                     // Arbeitsleistung / Support Services addieren
-                    var zaehlenWenn = ["Arbeitsleistung", "Supportleistungen", "Supportpauschale"];
+                    var zaehlenWenn = ["Arbeitsleistung", "Supportleistungen", "Supportpauschale", "Dienstl.-pauschale"];
                     if( zaehlenWenn.indexOf(taetigkeit) > -1 ){
                         istStundenMonat = istStundenMonat + stunden;
 
