@@ -1,5 +1,7 @@
+/* global waitForKeyElements */
 // ==UserScript==
 // @name         cims4you_Arbeitsleistungsrechner
+// @description  Arbeitsleistungsrechner
 // @namespace    http://tampermonkey.net/
 // @version      0.4
 // @author       Florian Deutsch / linkFISH Consulting
@@ -105,7 +107,7 @@
                         sollStundenMonat = sollStundenMonat - stunden;
 
                         // ermittle Soll-Stunden Heute
-                        if(day <= cur_day){
+                        if(day < cur_day){
                             sollStundenHeute = sollStundenHeute - stunden;
                         }
                     }
