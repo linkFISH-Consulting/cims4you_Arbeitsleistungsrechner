@@ -1,13 +1,17 @@
 name: Release
 
-# Triggered by pushing a semver tag, e.g. `git tag v0.7.0 && git push origin v0.7.0`.
+# Triggered by pushing to master, or manually via "Run workflow". Bump the VERSION
+# file (and the userscript's @version header + CHANGELOG.md entry) as part of your
+# PR; once merged, this workflow tags that version and publishes a GitHub release
+# automatically. If VERSION wasn't changed (i.e. that tag already exists), the
+# release is skipped - so it's always safe to (re-)run manually.
 # Publishes a GitHub release containing:
 #   - the raw .user.js file (kept at a stable "latest" URL for @updateURL/@downloadURL)
 #   - a zip archive with the userscript, the full changelog, and the notes for this version
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,9 +20,12 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -28,21 +35,44 @@ jobs:
       - run: npm test
       - run: npm run verify-version
 
+      - name: Check whether this version was already released
+        id: check
+        run: |
+          VERSION="$(cat VERSION)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "Tag v$VERSION already exists, skipping release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag this version
+        if: steps.check.outputs.release == 'true'
+        run: |
+          git tag "v${{ steps.check.outputs.version }}"
+          git push origin "v${{ steps.check.outputs.version }}"
+
       - name: Extract release notes from CHANGELOG.md
-        run: node scripts/extract-changelog.js "$(cat VERSION)" > RELEASE_NOTES.md
+        if: steps.check.outputs.release == 'true'
+        run: node scripts/extract-changelog.js "${{ steps.check.outputs.version }}" > RELEASE_NOTES.md
 
       - name: Build release archive
+        if: steps.check.outputs.release == 'true'
         run: |
-          zip -j "cims4you_Arbeitsleistungsrechner-$(cat VERSION).zip" \
+          zip -j "cims4you_Arbeitsleistungsrechner-${{ steps.check.outputs.version }}.zip" \
             cims4you_Arbeitsleistungsrechner.user.js \
             CHANGELOG.md \
             RELEASE_NOTES.md
 
       - name: Create GitHub release
+        if: steps.check.outputs.release == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          tag_name: v${{ steps.check.outputs.version }}
+          name: v${{ steps.check.outputs.version }}
           body_path: RELEASE_NOTES.md
           files: |
             cims4you_Arbeitsleistungsrechner.user.js
             cims4you_Arbeitsleistungsrechner-*.zip
+
