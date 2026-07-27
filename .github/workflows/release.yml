@@ -1,0 +1,48 @@
+name: Release
+
+# Triggered by pushing a semver tag, e.g. `git tag v0.7.0 && git push origin v0.7.0`.
+# Publishes a GitHub release containing:
+#   - the raw .user.js file (kept at a stable "latest" URL for @updateURL/@downloadURL)
+#   - a zip archive with the userscript, the full changelog, and the notes for this version
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run verify-version
+
+      - name: Extract release notes from CHANGELOG.md
+        run: node scripts/extract-changelog.js "$(cat VERSION)" > RELEASE_NOTES.md
+
+      - name: Build release archive
+        run: |
+          zip -j "cims4you_Arbeitsleistungsrechner-$(cat VERSION).zip" \
+            cims4you_Arbeitsleistungsrechner.user.js \
+            CHANGELOG.md \
+            RELEASE_NOTES.md
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            cims4you_Arbeitsleistungsrechner.user.js
+            cims4you_Arbeitsleistungsrechner-*.zip
