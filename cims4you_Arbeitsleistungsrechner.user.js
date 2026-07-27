@@ -3,7 +3,7 @@
 // @name         cims4you_Arbeitsleistungsrechner
 // @description  Arbeitsleistungsrechner
 // @namespace    http://tampermonkey.net/
-// @version      0.4
+// @version      0.7.0
 // @author       Florian Deutsch / linkFISH Consulting
 // @match        https://www.cims4you.com/zeiterfassung.php*
 // @require      https://www.cims4you.com/js/jquery-3.3.1.min.js
@@ -11,138 +11,234 @@
 // @require      https://gist.github.com/raw/2625891/waitForKeyElements.js
 // @grant        GM_addStyle
 // @run-at       document-idle
+// @updateURL    https://github.com/linkFISH-Consulting/cims4you_Arbeitsleistungsrechner/releases/latest/download/cims4you_Arbeitsleistungsrechner.user.js
+// @downloadURL  https://github.com/linkFISH-Consulting/cims4you_Arbeitsleistungsrechner/releases/latest/download/cims4you_Arbeitsleistungsrechner.user.js
 // ==/UserScript==
 
-(function() {
-    waitForKeyElements("#gview_list_tagessicht", function () {
-
+(function () {
     'use strict';
-    var $ = window.jQuery;
 
-    // aktuellen Benutzer und Datum ermitteln
-    var benutzerArr = document.querySelector(".welcome b").innerText.split(" ", 2);
-    var aktuellerBenutzer = benutzerArr[1] + " " + benutzerArr[0];
-    var currentdate = new Date();
-    var cur_day = currentdate.getDate();
-    var cur_month = currentdate.getMonth() + 1;
-    var cur_year =currentdate.getFullYear();
-    var cur_month_format = ('0' + (currentdate.getMonth()+1)).slice(-2);
-      
-    // Variablen Monatsberechnung
-    var sollStundenMonat = 0.0;
-    var sollStundenHeute = 0.0;
-    var istStundenMonat = 0.0;
-    var istStundenHeute = 0.0;
+    // ------------------------------------------------------------------
+    // Konfiguration
+    // ------------------------------------------------------------------
 
-    // Monat SOLL
-    $.post('./extensions/ext_zeiterfassung/b_ze_monatssicht_tbl.php', { jahr: cur_year, monat : cur_month},
-    function(returnedData){
-        var monatSollHtml = new DOMParser().parseFromString(returnedData, 'text/html');
-        var tableCells = monatSollHtml.querySelectorAll("td");
+    // Zuordnung der benoetigten Felder.
+    // Der Server liefert row.cell als Objekt mit benannten Keys ("name").
+    // "index" dient nur noch als Fallback fuer das alte Array-Format.
+    const FIELDS = {
+        datum:      { index: 2,  name: 'datum' },
+        bearbeiter: { index: 3,  name: 'bearbeiter' },
+        taetigkeit: { index: 8,  name: 'taetigkeit' },
+        stunden:    { index: 11, name: 'zeitaufwand' },
+    };
 
-        for (var i = 8; i < tableCells.length; i+=4){
-            var tagMonatJahr = tableCells[i].firstChild.data.split(",", 1)[0].split('.');
-            var sollTag = tagMonatJahr[0];
-            var sollMonat = tagMonatJahr[1];
-            var sollJahr = tagMonatJahr[2];
+    // Taetigkeiten, die als geleistete Arbeit zaehlen
+    const IST_TAETIGKEITEN = [
+        'Arbeitsleistung',
+        'Supportleistungen',
+        'Supportpauschale',
+        'Dienstl.-pauschale',
+    ];
 
-            // ermittle SollStunden heute
-            if(sollTag <= cur_day && cur_month == sollMonat && cur_year == sollJahr)
-            {
-                var sollStundenTag = parseFloat(tableCells[i+1].firstChild.data);
-                sollStundenHeute = sollStundenHeute + sollStundenTag;
+    // Taetigkeiten, die die Soll-Stunden reduzieren
+    const SOLL_ABZUG_TAETIGKEITEN = ['Feiertag', 'Krankheit', 'Urlaub'];
+
+    // ------------------------------------------------------------------
+    // Hilfsfunktionen
+    // ------------------------------------------------------------------
+
+    /** Liest ein Feld aus einer jqGrid-Zeile, egal welches Format der Server liefert. */
+    function getField(row, field) {
+        const cell = row.cell;
+        if (Array.isArray(cell)) return cell[field.index];       // altes Format: Array
+        if (cell && typeof cell === 'object') return cell[field.name]; // neues Format: Objekt
+        return row[field.name]; // Fallback: Properties direkt auf der Zeile
+    }
+
+    /**
+     * Benutzervergleich unabhaengig von der Wortreihenfolge:
+     * "Florian Deutsch" und "Deutsch Florian" gelten als dieselbe Person.
+     */
+    function nameSchluessel(name) {
+        return name.toLowerCase().split(/\s+/).filter(Boolean).sort().join(' ');
+    }
+
+    function istGleicherBenutzer(bearbeiter, aktuellerBenutzer) {
+        if (typeof bearbeiter !== 'string' || bearbeiter.trim() === '') return false;
+        return nameSchluessel(bearbeiter) === nameSchluessel(aktuellerBenutzer);
+    }
+
+    /** "27.07.2026" (ggf. mit Uhrzeit) -> Date. Gibt null zurueck bei ungueltiger Eingabe. */
+    function parseGermanDate(input) {
+        if (typeof input !== 'string') return null;
+        const parts = input.match(/(\d+)/g);
+        if (!parts || parts.length < 3) return null;
+        return new Date(+parts[2], +parts[1] - 1, +parts[0]); // Jahr, Monat-1, Tag
+    }
+
+    /**
+     * Liest den Namen aus der Begruessungszeile (unveraendert, z.B. "Deutsch Florian").
+     * Die Wortreihenfolge ist egal, da der Vergleich reihenfolgeunabhaengig erfolgt.
+     */
+    function getAktuellenBenutzer() {
+        return document.querySelector('.welcome b').innerText.trim();
+    }
+
+    // ------------------------------------------------------------------
+    // Datenabruf
+    // ------------------------------------------------------------------
+
+    /** Laedt die Monats-Sollstunden. Ergebnis: { monat, bisHeute } */
+    function ladeSollStunden(jahr, monat, heutigerTag) {
+        return new Promise((resolve, reject) => {
+            $.post(
+                './extensions/ext_zeiterfassung/b_ze_monatssicht_tbl.php',
+                { jahr, monat },
+                (html) => {
+                    const doc = new DOMParser().parseFromString(html, 'text/html');
+                    const zellen = doc.querySelectorAll('td');
+
+                    let bisHeute = 0;
+                    // Ab Zelle 8 folgen 4er-Bloecke: Datum | Soll | ... | ...
+                    for (let i = 8; i < zellen.length; i += 4) {
+                        const datumText = zellen[i]?.firstChild?.data;
+                        if (!datumText) continue;
+
+                        const [tag, m, j] = datumText.split(',', 1)[0].split('.').map(Number);
+                        if (tag <= heutigerTag && m === monat && j === jahr) {
+                            bisHeute += parseFloat(zellen[i + 1]?.firstChild?.data) || 0;
+                        }
+                    }
+
+                    const monatText = doc.querySelector('tbody tr td:nth-child(2)')?.innerText;
+                    resolve({ monat: parseFloat(monatText) || 0, bisHeute });
+                }
+            ).fail(reject);
+        });
+    }
+
+    /** Laedt alle Zeiteintraege fuer den Monat. Ergebnis: Array von Zeilen. */
+    function ladeZeitEintraege(benutzer, jahr, monatFormat) {
+        // Fuer den serverseitigen "contains"-Filter nur EIN Namenswort verwenden,
+        // damit die Reihenfolge (Vorname/Nachname) keine Rolle spielt.
+        // Die genaue Zuordnung passiert danach clientseitig via istGleicherBenutzer().
+        const filterName = benutzer.split(/\s+/)[0] || benutzer;
+
+        return new Promise((resolve, reject) => {
+            $.get('./zeiterfassung_list_resultset.php', {
+                _search: 'true',
+                sidx: 'datum',
+                sord: 'desc',
+                rows: '10000',
+                totalrows: '10000',
+                filters: JSON.stringify({
+                    groupOp: 'AND',
+                    rules: [
+                        { field: 'datum', op: 'cn', data: `${monatFormat}.${jahr}` },
+                        { field: 'bearbeiter', op: 'cn', data: filterName },
+                    ],
+                }),
+            }, (data) => {
+                try {
+                    resolve(JSON.parse(data).rows || []);
+                } catch (e) {
+                    reject(e);
+                }
+            }).fail(reject);
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Berechnung & Anzeige
+    // ------------------------------------------------------------------
+
+    function berechneUndZeige() {
+        const benutzer = getAktuellenBenutzer();
+        const jetzt = new Date();
+        const jahr = jetzt.getFullYear();
+        const monat = jetzt.getMonth() + 1;
+        const tag = jetzt.getDate();
+        const monatFormat = String(monat).padStart(2, '0');
+
+        Promise.all([
+            ladeSollStunden(jahr, monat, tag),
+            ladeZeitEintraege(benutzer, jahr, monatFormat),
+        ]).then(([soll, zeilen]) => {
+            let sollMonat = soll.monat;
+            let sollHeute = soll.bisHeute;
+            let istMonat = 0;
+            let istHeute = 0;
+
+            // Einmalig die Rohstruktur loggen, um Format-/Spaltenaenderungen zu erkennen
+            if (zeilen.length > 0) {
+                console.log('Arbeitsleistungsrechner – Erste Zeile (roh):', zeilen[0]);
             }
-        }
 
-        var monatSoll = monatSollHtml.querySelector('tbody tr td:nth-child(2)').innerText;        
-        sollStundenMonat = parseFloat(monatSoll);
-    });
+            for (const zeile of zeilen) {
+                const datum = parseGermanDate(getField(zeile, FIELDS.datum));
+                if (!datum) {
+                    console.warn('Zeile ohne gueltiges Datum uebersprungen:', zeile);
+                    continue;
+                }
+                if (datum.getFullYear() !== jahr || datum.getMonth() + 1 !== monat) continue;
+                if (!istGleicherBenutzer(getField(zeile, FIELDS.bearbeiter), benutzer)) continue;
 
-    // Monat IST
-    $.get('./zeiterfassung_list_resultset.php', {
-        _search: "true",
-        sidx: "datum",
-        sord: "desc",
-        rows: "10000",
-        totalrows: "10000",
-        filters: '{"groupOp":"AND","rules":[{"field":"datum","op":"cn","data":"' + cur_month_format + '.' + cur_year.toString() + '"},{"field":"bearbeiter","op":"cn","data":"' + aktuellerBenutzer + '"}]}'
-        }, function(data) {
-        var record = JSON.parse(data);
+                const taetigkeit = getField(zeile, FIELDS.taetigkeit);
+                const stunden = parseFloat(getField(zeile, FIELDS.stunden)) || 0;
+                const zeilenTag = datum.getDate();
 
-        for (var i = 0; i < record.rows.length; i++){
-
-            var eintrag = record.rows[i].cell;
-            var zeit = parseDate(eintrag[2]);
-            var year = zeit.getFullYear();
-            var month = zeit.getMonth() + 1;
-            var day = zeit.getDate();						            
-            
-            // ermittle Ist-Stunden Monat
-            if(cur_month == month && year == cur_year)              
-            {
-                var benutzer = eintrag[3];
-                var kunde = eintrag[4];
-                var auftrag = eintrag[5];
-                var typ = eintrag[8];
-                var stundenVorschlag = eintrag[11];
-                // check for current user
-                if(benutzer == aktuellerBenutzer){
-                    var stunden = eintrag[11];
-                    var taetigkeit = eintrag[8];
-
-                    // Arbeitsleistung / Support Services addieren
-                    var zaehlenWenn = ["Arbeitsleistung", "Supportleistungen", "Supportpauschale", "Dienstl.-pauschale"];
-                    if( zaehlenWenn.indexOf(taetigkeit) > -1 ){
-                        istStundenMonat = istStundenMonat + stunden;
-
-                        // ermittle Ist-Stunden Heute
-                        if(day <= cur_day){
-                            istStundenHeute = istStundenHeute + stunden;
-                        }
-                    }
-
-                    var sollAbzug = ["Feiertag", "Krankheit", "Urlaub"];
-                    if(sollAbzug.indexOf(taetigkeit) > -1){
-                        console.log("Abzug: " + stunden);
-                        sollStundenMonat = sollStundenMonat - stunden;
-
-                        // ermittle Soll-Stunden Heute
-                        if(day < cur_day){
-                            sollStundenHeute = sollStundenHeute - stunden;
-                        }
-                    }
-
+                if (IST_TAETIGKEITEN.includes(taetigkeit)) {
+                    istMonat += stunden;
+                    if (zeilenTag <= tag) istHeute += stunden;
+                } else if (SOLL_ABZUG_TAETIGKEITEN.includes(taetigkeit)) {
+                    sollMonat -= stunden;
+                    if (zeilenTag < tag) sollHeute -= stunden;
                 }
             }
-        }
 
-        var anteilArbeitsLeistungHeute = ((istStundenHeute/sollStundenHeute) * 100).toFixed(2);
-        var anteilArbeitsLeistungMonat = ((istStundenMonat/sollStundenMonat) * 100).toFixed(2);
+            const anteilHeute = sollHeute > 0 ? ((istHeute / sollHeute) * 100).toFixed(2) : '–';
+            const anteilMonat = sollMonat > 0 ? ((istMonat / sollMonat) * 100).toFixed(2) : '–';
 
-        console.log("Berechnung Anteil heute: (" + istStundenHeute + "/" + sollStundenHeute + ") * 100 = " + anteilArbeitsLeistungHeute);
-        console.log("Berechnung Anteil Monat: (" + istStundenMonat + "/" + sollStundenMonat + ") * 100 = " + anteilArbeitsLeistungMonat);
-        // schoenen Platz suchen
-        var placementRow = document.querySelector("#zeituebersicht_content .form-row");
-        $("#zeituebersicht_content .form-row").append( `
-    <div style="display: inline-block; text-align:right; margin: 0px 0px 0px 80px">
-      <b>Arbeitsleistung (Stand heute):</b><br>
-      <b>Arbeitsleistung (Monat):</b>
-    </div>
-    <div style="display: inline-block; text-align:right; margin: 0px 0px 0px 10px">
-      <b><span id="anteilHeute">100</span>%</b><br>
-      <b><span id="anteilMonat">100</span>%</b>
-    </div>
-` );
-        $("#anteilHeute").text(anteilArbeitsLeistungHeute);
-        $("#anteilMonat").text(anteilArbeitsLeistungMonat);
+            console.log(`Anteil heute: (${istHeute}/${sollHeute}) * 100 = ${anteilHeute}`);
+            console.log(`Anteil Monat: (${istMonat}/${sollMonat}) * 100 = ${anteilMonat}`);
 
-    });
-   });
+            zeigeErgebnis(anteilHeute, anteilMonat);
+        }).catch((err) => {
+            console.error('Arbeitsleistungsrechner fehlgeschlagen:', err);
+        });
+    }
+
+    function zeigeErgebnis(anteilHeute, anteilMonat) {
+        $('#zeituebersicht_content .form-row').append(`
+            <div style="display:inline-block; text-align:right; margin:0 0 0 80px">
+                <b>Arbeitsleistung (Stand heute):</b><br>
+                <b>Arbeitsleistung (Monat):</b>
+            </div>
+            <div style="display:inline-block; text-align:right; margin:0 0 0 10px">
+                <b><span id="anteilHeute"></span>%</b><br>
+                <b><span id="anteilMonat"></span>%</b>
+            </div>
+        `);
+        $('#anteilHeute').text(anteilHeute);
+        $('#anteilMonat').text(anteilMonat);
+    }
+
+    // ------------------------------------------------------------------
+    // Start
+    // ------------------------------------------------------------------
+
+    // Nur im Browser gegen die echte Seite starten; in Node (z.B. fuer Tests) ueberspringen.
+    if (typeof window !== 'undefined' && typeof waitForKeyElements !== 'undefined') {
+        var $ = window.jQuery;
+
+        waitForKeyElements('#gview_list_tagessicht', () => {
+            window.jQuery ? berechneUndZeige() : console.error('jQuery nicht verfuegbar');
+        });
+    }
+
+    // Reine Hilfsfunktionen fuer Unit-Tests unter Node exponieren, ohne das
+    // Userscript im Browser zu beeinflussen.
+    if (typeof module !== 'undefined' && module.exports) {
+        module.exports = { parseGermanDate, nameSchluessel, istGleicherBenutzer, getField };
+    }
 })();
-
-function parseDate(input) {
-  var parts = input.match(/(\d+)/g);
-  // note parts[1]-1
-  return new Date(parts[2], parts[1]-1, parts[0]);
-}
-

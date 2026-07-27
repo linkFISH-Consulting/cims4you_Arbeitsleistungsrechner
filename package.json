@@ -1,0 +1,16 @@
+{
+  "name": "cims4you_arbeitsleistungsrechner",
+  "version": "0.7.0",
+  "private": true,
+  "description": "Tampermonkey userscript that calculates Arbeitsleistung percentages on cims4you.com",
+  "scripts": {
+    "lint": "eslint .",
+    "test": "node --test",
+    "verify-version": "node scripts/check-version.js",
+    "changelog:extract": "node scripts/extract-changelog.js"
+  },
+  "devDependencies": {
+    "eslint": "^10.8.0",
+    "globals": "^15.14.0"
+  }
+}
